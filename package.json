@@ -1,0 +1,7 @@
+{
+  "name": "company-brain-frontend",
+  "private": true,
+  "scripts": { "dev": "cd frontend && vite", "build": "cd frontend && vite build" },
+  "dependencies": { "@vitejs/plugin-react": "latest", "vite": "latest", "react": "latest", "react-dom": "latest" },
+  "devDependencies": {}
+}
