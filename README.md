@@ -4,7 +4,21 @@
 
 Company Brain brings company knowledge from code repositories, team conversations, and documents into one connected system. It aims to help people find information, understand relationships, discover decisions, and answer questions with relevant supporting context.
 
-> **Project status:** Architecture and implementation scaffold. Update this section as integrations and features become operational. Do not describe a feature as complete until it has been implemented and tested.
+> **Project status:** A runnable MVP is implemented, but the production integrations are not complete yet. The current application has a FastAPI API, React chat UI, typed contracts, in-memory knowledge repository, normalization/chunking, keyword retrieval, grounded responses with citations, graph exploration, webhook endpoints, Docker configuration, and automated backend tests. FalkorDB persistence, provider API synchronization, embeddings/vector retrieval, and a real LLM client are still pending.
+
+## Current implementation summary
+
+The current version is deliberately a local development slice:
+
+- `backend/app/main.py` creates the FastAPI application and exposes health, chat, search, graph, integrations, and webhook routes.
+- `backend/app/graph/repository.py` is an in-memory repository. It is not yet backed by FalkorDB, so all ingested knowledge is lost when the backend restarts.
+- `backend/app/ingestion/` normalizes records, chunks long text, hashes content, and upserts records idempotently.
+- `backend/app/rag/pipeline.py` performs keyword retrieval and returns retrieved evidence as a grounded response. It does not call an LLM yet.
+- `backend/app/api/webhooks/` contains the initial GitHub, Slack, and Google webhook routes. GitHub and Slack secrets can be configured, but provider clients and full synchronization workflows are not implemented.
+- `frontend/` contains a minimal React chat screen that calls the FastAPI API.
+- `backend/tests/test_core.py` covers chunking, search, chat citations, and graph output.
+
+Because the repository starts empty and the current seed script uses a standalone repository, a fresh server will correctly report that it has no supporting evidence until records are ingested through an implemented ingestion path. The LLM provider is currently a stub; configure a real provider only after the LLM adapter is implemented.
 
 ---
 
@@ -18,20 +32,8 @@ Company Brain brings company knowledge from code repositories, team conversation
 6. [Backend Folder Guide](#6-backend-folder-guide)
 7. [Frontend Folder Guide](#7-frontend-folder-guide)
 8. [Data and Scripts](#8-data-and-scripts)
-9. [How Data Flows Through the System](#9-how-data-flows-through-the-system)
-10. [Knowledge Graph Design](#10-knowledge-graph-design)
-11. [RAG and LLM Flow](#11-rag-and-llm-flow)
-12. [API Responsibilities](#12-api-responsibilities)
-13. [Environment Configuration](#13-environment-configuration)
-14. [Local Development Setup](#14-local-development-setup)
-15. [Implementation Order](#15-implementation-order)
-16. [Testing](#16-testing)
-17. [Security and Privacy](#17-security-and-privacy)
-18. [Git and `.gitignore`](#18-git-and-gitignore)
-19. [Team Responsibilities](#19-team-responsibilities)
-20. [Troubleshooting](#20-troubleshooting)
-21. [Contributing](#21-contributing)
-22. [Roadmap](#22-roadmap)
+9. [External Resource Configuration](#23-external-resource-configuration)
+10. [Running the Current MVP](#24-running-the-current-mvp)
 
 ---
 
@@ -516,6 +518,168 @@ These directories are for development workflows, not the canonical knowledge sto
 Scripts should reuse the same integration, normalization, and repository functions as the API. Avoid maintaining a separate, inconsistent ingestion implementation in each script.
 
 Before running a rebuild, confirm the target graph and data source. Destructive reset operations should require an explicit flag and clear warning.
+
+---
+
+## 23. External Resource Configuration
+
+The configuration below describes the target setup and the current implementation boundary. Creating credentials alone does not activate an integration: the corresponding provider client and ingestion workflow must also be implemented and connected to the application.
+
+### 23.1 Base environment file
+
+Create a local environment file from the template:
+
+```powershell
+Copy-Item backend/.env.example backend/.env
+```
+
+The settings currently read by the backend are:
+
+```dotenv
+ENVIRONMENT=development
+FRONTEND_ORIGIN=http://localhost:5173
+FALKORDB_URL=redis://localhost:6379
+FALKORDB_GRAPH=company_brain
+GITHUB_WEBHOOK_SECRET=replace-with-a-long-random-secret
+SLACK_SIGNING_SECRET=replace-with-the-slack-signing-secret
+LLM_PROVIDER=stub
+LLM_MODEL=local-grounded
+```
+
+Do not commit `.env`, OAuth client secrets, private keys, refresh tokens, or provider access tokens. Use a secret manager in deployed environments.
+
+### 23.2 FalkorDB
+
+For local development, start the database service defined in the root Compose file:
+
+```powershell
+docker compose up -d falkordb
+```
+
+The default connection values are:
+
+```dotenv
+FALKORDB_URL=redis://localhost:6379
+FALKORDB_GRAPH=company_brain
+```
+
+Inside Docker Compose, the backend should use `redis://falkordb:6379` instead of `localhost`.
+
+Important: FalkorDB is currently provisioned by Docker and its connection settings are loaded, but `KnowledgeRepository` still uses in-memory storage. The next graph implementation must add a FalkorDB client, parameterized Cypher queries, schema/index initialization, and a persistent repository adapter before these values affect application data.
+
+### 23.3 GitHub
+
+For webhook-based development:
+
+1. Create a GitHub App or a repository webhook with only the repository permissions and events the ingestion workflow needs.
+2. Set the payload URL to `https://YOUR_PUBLIC_HOST/api/webhooks/github`.
+3. Select `application/json` as the content type.
+4. Generate a high-entropy webhook secret and put the same value in `GITHUB_WEBHOOK_SECRET`.
+5. Subscribe only to the events required by the ingestion design, such as issues, pull requests, pull request reviews, pushes, and releases.
+6. For local development, expose the API through a secure HTTPS tunnel; GitHub must be able to reach the webhook URL.
+
+The current endpoint validates `X-Hub-Signature-256` when `GITHUB_WEBHOOK_SECRET` is set and stores a normalized event in the in-memory repository. GitHub REST/GraphQL ingestion, repository backfills, token configuration, pagination, and event-specific mapping are not implemented yet. See the [GitHub webhook documentation](https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks) and [GitHub permission guidance](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app).
+
+### 23.4 Slack
+
+For the intended Slack integration:
+
+1. Create a Slack app in the target workspace.
+2. Configure OAuth scopes narrowly. Typical read-only scopes will depend on whether the app needs public channels, private channels, files, users, or message history.
+3. Install the app into the workspace and retain the bot token securely.
+4. Copy the app's **Signing Secret** to `SLACK_SIGNING_SECRET`.
+5. Configure Event Subscriptions with `https://YOUR_PUBLIC_HOST/api/webhooks/slack` as the request URL.
+6. Subscribe only to the message and file events that the ingestion workflow is authorized to process.
+7. Confirm that the app has been invited to any channels whose messages it must read; installation does not grant access to every private channel.
+
+The current endpoint supports Slack URL verification and checks a basic HMAC signature when `SLACK_SIGNING_SECRET` is set, but it does not yet implement Slack OAuth token storage, history pagination, thread retrieval, or production-grade Slack timestamp/replay validation. Do not treat the current webhook as production-ready. Refer to Slack's [OAuth documentation](https://api.slack.com/authentication/oauth-v2), [event subscriptions](https://api.slack.com/apis/events-api), and [request verification](https://api.slack.com/authentication/verifying-requests-from-slack).
+
+### 23.5 Google Drive and Google Docs
+
+For the intended Google integration:
+
+1. Create or select a project in Google Cloud.
+2. Enable the Google Drive API and Google Docs API.
+3. Configure the OAuth consent screen and add only the scopes required for the selected ingestion flow.
+4. Create OAuth 2.0 credentials for the application type used by the deployment. Register local callback URLs for development and HTTPS callback URLs for deployment.
+5. Store the client ID, client secret, access token, and refresh token outside Git. Prefer a secret manager or encrypted token store.
+6. Restrict ingestion to approved shared drives, folders, or documents and preserve source URLs and access metadata in normalized records.
+
+Google credentials are not read by the current application: there are no Google credential settings or completed Drive/Docs client flows yet. The Google webhook route is only a placeholder. The required scopes must be finalized when the OAuth and document synchronization implementation is added. See Google's [Drive authentication and scope guidance](https://developers.google.com/workspace/drive/api/guides/api-specific-auth) and [Drive quickstart](https://developers.google.com/drive/api/quickstart).
+
+### 23.6 LLM and embeddings
+
+The current RAG pipeline does not call an external model. It uses keyword search and formats retrieved evidence directly. Therefore the only valid current setting is:
+
+```dotenv
+LLM_PROVIDER=stub
+LLM_MODEL=local-grounded
+```
+
+When a provider adapter is implemented, add provider-specific settings to `backend/app/config/settings.py` and `backend/.env.example`, for example:
+
+```dotenv
+LLM_PROVIDER=<provider-name>
+LLM_MODEL=<model-name>
+LLM_API_KEY=<secret>
+EMBEDDING_PROVIDER=<provider-name>
+EMBEDDING_MODEL=<embedding-model-name>
+```
+
+Do not add these variables to a deployment until the corresponding adapter reads and validates them. The future adapter must keep retrieved source text separate from system instructions, enforce a grounded-answer policy, and return citations. Vector retrieval and reranking are also not connected yet.
+
+### 23.7 Frontend
+
+The frontend reads the backend base URL from `VITE_API_URL`. For local development, create `frontend/.env.local`:
+
+```dotenv
+VITE_API_URL=http://localhost:8000/api
+```
+
+The backend's `FRONTEND_ORIGIN` must match the origin serving the frontend, normally `http://localhost:5173`.
+
+---
+
+## 24. Running the Current MVP
+
+### Local processes
+
+From the repository root:
+
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+python -m uvicorn app.main:app --reload
+```
+
+In another terminal:
+
+```powershell
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. The API is available at `http://localhost:8000`, with health at `/api/health` and interactive API documentation at `/docs`.
+
+### Docker
+
+```powershell
+docker compose up --build
+```
+
+This starts the frontend, backend, and FalkorDB containers. Until the persistent FalkorDB adapter is implemented, the backend still keeps knowledge in memory.
+
+### Testing
+
+```powershell
+cd backend
+.venv\Scripts\python.exe -m pytest -q
+```
+
+The current tests validate the local ingestion/search/chat/graph slice. They do not verify live provider credentials or external services.
 
 ---
 
